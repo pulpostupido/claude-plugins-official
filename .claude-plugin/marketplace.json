@@ -1148,6 +1148,16 @@
         "sha": "215568baf203887b5d7f8245e0503dd4a81336c2"
       },
       "homepage": "https://github.com/PAIR-Systems-Inc/goodmem-claude-code-plugin"
+    },
+    {
+      "name": "elixir-ls-lsp",
+      "description": "Elixir language server (ElixirLS) for Claude Code — provides code intelligence and diagnostics for .ex, .exs, and .heex files.",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/MikaelFangel/claude-elixir-ls-lsp.git",
+        "sha": "806a6eeeb88b9a306a59b3212a1d5d88aa5c70af"
+      },
+      "homepage": "https://elixir-lsp.github.io/elixir-ls/"
     }
   ]
 }
