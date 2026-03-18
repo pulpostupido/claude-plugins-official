@@ -1088,6 +1088,16 @@
         "sha": "e4d23c3bffdcdb7f70134ab6a1a110258ff75cfd"
       },
       "homepage": "https://developer.wordpress.com/wordpress-com-claude-code-plugin/"
+    },
+    {
+      "name": "nimble",
+      "description": "Nimble web data toolkit — search, extract, map, crawl the web and work with structured data agents",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Nimbleway/agent-skills.git",
+        "sha": "cf391e95bd8ac009e3641f172434a1d130dde7fe"
+      },
+      "homepage": "https://docs.nimbleway.com/integrations/agent-skills/plugin-installation"
     }
   ]
 }
