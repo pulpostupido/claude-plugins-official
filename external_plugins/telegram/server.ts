@@ -520,24 +520,21 @@ bot.command('start', async ctx => {
     return
   }
   await ctx.reply(
-    `👋 Hi! I'm a bridge between Telegram and Claude Code.\n\n` +
-    `How to set up:\n` +
-    `1. Send me any message here\n` +
-    `2. I'll give you a pairing code\n` +
-    `3. Run that code in Claude Code to link your account\n\n` +
-    `Once paired, your messages here go straight to Claude.`
+    `This bot bridges Telegram to a Claude Code session.\n\n` +
+    `To pair:\n` +
+    `1. DM me anything — you'll get a 6-char code\n` +
+    `2. In Claude Code: /telegram:access pair <code>\n\n` +
+    `After that, DMs here reach that session.`
   )
 })
 
 bot.command('help', async ctx => {
   if (ctx.chat?.type !== 'private') return
   await ctx.reply(
-    `I relay messages between Telegram and Claude Code.\n\n` +
-    `What works:\n` +
-    `- Text messages\n` +
-    `- Photos (with captions)\n` +
-    `- Replies to specific messages\n\n` +
-    `Use /start for setup instructions.`
+    `Messages you send here route to a paired Claude Code session. ` +
+    `Text and photos are forwarded; replies and reactions come back.\n\n` +
+    `/start — pairing instructions\n` +
+    `/status — check your pairing state`
   )
 })
 
