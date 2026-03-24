@@ -530,16 +530,14 @@ mcp.setNotificationHandler(
       request_id: z.string(),
       tool_name: z.string(),
       description: z.string(),
-      input_preview: z.string(),
     }),
   }),
   async ({ params }) => {
-    const { request_id, tool_name, description, input_preview } = params
+    const { request_id, tool_name, description } = params
     const access = loadAccess()
     const text =
       `🔐 Permission request [${request_id}]\n` +
-      `${tool_name}: ${description}\n` +
-      `${input_preview}\n\n` +
+      `${tool_name}: ${description}\n\n` +
       `Reply "yes ${request_id}" to allow or "no ${request_id}" to deny.`
     // allowFrom holds handle IDs, not chat GUIDs — resolve via qChatsForHandle.
     // Include SELF addresses so the owner's self-chat gets the prompt even
