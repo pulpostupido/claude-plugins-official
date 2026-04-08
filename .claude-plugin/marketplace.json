@@ -1217,8 +1217,7 @@
       "category": "security",
       "source": {
         "source": "url",
-        "url": "https://github.com/SonarSource/sonarqube-agent-plugins.git",
-        "sha": "0cae644cee9318e6245b62ca779abdc60e6daa49"
+        "url": "https://github.com/SonarSource/sonarqube-agent-plugins.git"
       },
       "homepage": "https://github.com/SonarSource/sonarqube-agent-plugins"
     },
