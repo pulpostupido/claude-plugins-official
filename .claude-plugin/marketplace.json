@@ -1,10 +1,10 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "claude-plugins-official",
-  "description": "Directory of popular Claude Code extensions including development tools, productivity plugins, and MCP integrations",
+  "name": "clobster-plugins",
+  "description": "William's fork of claude-plugins-official with local patches (telegram: /ctx, /new, /ping, /peek, retry logic).",
   "owner": {
-    "name": "Anthropic",
-    "email": "support@anthropic.com"
+    "name": "William",
+    "email": "william.frisch.moller@gmail.com"
   },
   "plugins": [
     {

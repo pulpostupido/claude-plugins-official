@@ -22,6 +22,9 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+const pexec = promisify(execFile)
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -85,6 +88,32 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
+
+// Outbound retry. 429 honors Telegram's retry_after; 5xx and network errors
+// get exponential backoff. 4xx (auth, bad request) fail fast — retry won't help.
+async function retryingSend<T>(fn: () => Promise<T>, label: string): Promise<T> {
+  const delays = [500, 1500, 4000, 8000]
+  for (let i = 0; i <= delays.length; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      const isLast = i === delays.length
+      const code = err instanceof GrammyError ? err.error_code : undefined
+      const retryable = code === 429 || (code != null && code >= 500) || code === undefined
+      if (isLast || !retryable) throw err
+      let delay = delays[i]!
+      if (code === 429) {
+        const ra = (err as GrammyError).parameters?.retry_after
+        if (typeof ra === 'number') delay = Math.max(delay, ra * 1000)
+      }
+      process.stderr.write(
+        `telegram channel: ${label} failed (${code ?? 'net'}), retry ${i + 1}/${delays.length} in ${delay}ms\n`,
+      )
+      await new Promise(r => setTimeout(r, delay))
+    }
+  }
+  throw new Error('unreachable')
+}
 
 type PendingEntry = {
   senderId: string
@@ -451,8 +480,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['text', 'markdownv2', 'html'],
+            description: "Rendering mode. 'html' enables Telegram formatting via HTML tags (<b>, <i>, <u>, <s>, <code>, <pre>, <a href=\"...\">, <blockquote>, <tg-spoiler>) — only <, >, & need escaping (as &lt; &gt; &amp;). 'markdownv2' uses Telegram MarkdownV2 (caller must escape _*[]()~`>#+-=|{}.! per spec). Default: 'text' (plain, no escaping).",
           },
         },
         required: ['chat_id', 'text'],
@@ -493,8 +522,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['text', 'markdownv2', 'html'],
+            description: "Rendering mode. 'html' enables Telegram formatting via HTML tags (<b>, <i>, <u>, <s>, <code>, <pre>, <a href=\"...\">, <blockquote>, <tg-spoiler>) — only <, >, & need escaping (as &lt; &gt; &amp;). 'markdownv2' uses Telegram MarkdownV2 (caller must escape _*[]()~`>#+-=|{}.! per spec). Default: 'text' (plain, no escaping).",
           },
         },
         required: ['chat_id', 'message_id', 'text'],
@@ -513,7 +542,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
-        const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const parseMode =
+          format === 'markdownv2' ? 'MarkdownV2' as const
+          : format === 'html' ? 'HTML' as const
+          : undefined
 
         assertAllowedChat(chat_id)
 
@@ -538,10 +570,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
-            const sent = await bot.api.sendMessage(chat_id, chunks[i], {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-            })
+            const sent = await retryingSend(
+              () => bot.api.sendMessage(chat_id, chunks[i], {
+                ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+                ...(parseMode ? { parse_mode: parseMode } : {}),
+              }),
+              'sendMessage',
+            )
             sentIds.push(sent.message_id)
           }
         } catch (err) {
@@ -560,10 +595,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             ? { reply_parameters: { message_id: reply_to } }
             : undefined
           if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
+            const sent = await retryingSend(() => bot.api.sendPhoto(chat_id, input, opts), 'sendPhoto')
             sentIds.push(sent.message_id)
           } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
+            const sent = await retryingSend(() => bot.api.sendDocument(chat_id, input, opts), 'sendDocument')
             sentIds.push(sent.message_id)
           }
         }
@@ -602,7 +637,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
         const editFormat = (args.format as string | undefined) ?? 'text'
-        const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const editParseMode =
+          editFormat === 'markdownv2' ? 'MarkdownV2' as const
+          : editFormat === 'html' ? 'HTML' as const
+          : undefined
         const edited = await bot.api.editMessageText(
           args.chat_id as string,
           Number(args.message_id),
@@ -690,7 +728,14 @@ bot.command('help', async ctx => {
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
-    `/status — check your pairing state`
+    `/status — check your pairing state\n` +
+    `/ping — liveness check (systemd state, uptime)\n` +
+    `/ctx — context %, model, rate limits, cost\n` +
+    `/opus, /sonnet, /haiku — switch model\n` +
+    `/fast — toggle fast mode\n` +
+    `/effort <low|medium|high|max> — reasoning effort\n` +
+    `/new — restart with a fresh session\n` +
+    `/stop — stop the agent (no auto-restart)`
   )
 })
 
@@ -717,6 +762,197 @@ bot.command('status', async ctx => {
   }
 
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
+})
+
+// --- Clobster control-plane commands (DM-only, allowlist-gated). ---
+// These are intercepted at the bot layer and never reach the Claude session,
+// so they keep working even if the agent is wedged.
+
+const SERVICE = 'clobster.service'
+const STATUS_FILE = join(STATE_DIR, 'status.json')
+
+function isAllowed(ctx: Context): boolean {
+  if (ctx.chat?.type !== 'private') return false
+  const from = ctx.from
+  if (!from) return false
+  return loadAccess().allowFrom.includes(String(from.id))
+}
+
+async function systemctlUser(...args: string[]): Promise<{ ok: boolean; out: string }> {
+  try {
+    const { stdout } = await pexec('systemctl', ['--user', ...args])
+    return { ok: true, out: stdout.trim() }
+  } catch (e: any) {
+    return { ok: false, out: (e.stdout ?? '').toString().trim() || (e.stderr ?? '').toString().trim() || String(e) }
+  }
+}
+
+bot.command('ping', async ctx => {
+  if (!isAllowed(ctx)) return
+  const { out: active } = await systemctlUser('is-active', SERVICE)
+  const { out: since } = await systemctlUser('show', '-p', 'ActiveEnterTimestamp', '--value', SERVICE)
+  const { out: mem } = await systemctlUser('show', '-p', 'MemoryCurrent', '--value', SERVICE)
+  let uptime = '?'
+  if (since && since !== '0') {
+    const started = Date.parse(since)
+    if (!Number.isNaN(started)) {
+      const secs = Math.floor((Date.now() - started) / 1000)
+      const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60)
+      uptime = d > 0 ? `${d}d${h}h` : h > 0 ? `${h}h${m}m` : `${m}m`
+    }
+  }
+  const memMb = mem && /^\d+$/.test(mem) ? `${(Number(mem) / 1024 / 1024).toFixed(1)} MB` : '?'
+  const emoji = active === 'active' ? '🦞' : '💀'
+  await ctx.reply(`${emoji} ${SERVICE}: ${active}\nuptime: ${uptime}\nmem: ${memMb}`)
+})
+
+bot.command('ctx', async ctx => {
+  if (!isAllowed(ctx)) return
+  let data: any = null
+  try {
+    data = JSON.parse(readFileSync(STATUS_FILE, 'utf8'))
+  } catch {}
+  if (!data) {
+    await ctx.reply(
+      `No context data yet. Need a write-through hook that dumps statusline JSON to:\n${STATUS_FILE}\n\n(Not wired yet — on the todo.)`
+    )
+    return
+  }
+  const lines: string[] = []
+  if (data.model?.display_name) lines.push(`🤖 <b>${data.model.display_name}</b>`)
+  if (typeof data.effort === 'string' && data.effort) {
+    lines.push(`🎚 effort: ${data.effort}`)
+  }
+  if (typeof data.context_window?.used_percentage === 'number') {
+    lines.push(`🧠 ctx: ${data.context_window.used_percentage.toFixed(0)}%`)
+  }
+  if (typeof data.cost?.total_cost_usd === 'number') {
+    lines.push(`💰 $${data.cost.total_cost_usd.toFixed(2)}`)
+  }
+  const fmtLim = (label: string, lim: any) => {
+    if (!lim || typeof lim.used_percentage !== 'number') return null
+    const pct = lim.used_percentage.toFixed(0)
+    let resetIn = ''
+    // resets_at comes in as epoch seconds (number) or ms, or an ISO string.
+    // Date.parse on a number returns NaN — hence the explicit branch.
+    let resetMs: number | null = null
+    if (typeof lim.resets_at === 'number') {
+      resetMs = lim.resets_at > 1e12 ? lim.resets_at : lim.resets_at * 1000
+    } else if (typeof lim.resets_at === 'string') {
+      const p = Date.parse(lim.resets_at)
+      if (!Number.isNaN(p)) resetMs = p
+    }
+    if (resetMs !== null) {
+      const diff = Math.floor((resetMs - Date.now()) / 1000)
+      if (diff > 0) {
+        const h = Math.floor(diff / 3600), m = Math.floor((diff % 3600) / 60)
+        const rel = h > 0 ? `${h}h${m}m` : `${m}m`
+        const tz = 'Europe/Copenhagen'
+        const clock = new Date(resetMs).toLocaleTimeString('en-GB', {
+          hour: '2-digit', minute: '2-digit', timeZone: tz,
+        })
+        // Show weekday once we're more than ~20h out — clock alone is ambiguous.
+        const when = diff >= 20 * 3600
+          ? `${new Date(resetMs).toLocaleDateString('en-GB', { weekday: 'short', timeZone: tz })} ${clock}`
+          : clock
+        resetIn = ` · resets ${when} (${rel})`
+      }
+    }
+    return `⌛ ${label}: ${pct}%${resetIn}`
+  }
+  const f5 = fmtLim('5h', data.rate_limits?.five_hour); if (f5) lines.push(f5)
+  const f7 = fmtLim('7d', data.rate_limits?.seven_day); if (f7) lines.push(f7)
+  if (data.updated_at) {
+    const age = Math.floor((Date.now() - Date.parse(data.updated_at)) / 1000)
+    lines.push(`\n<i>updated ${age}s ago</i>`)
+  }
+  await ctx.reply(lines.join('\n') || 'Status file present but empty.', { parse_mode: 'HTML' })
+})
+
+bot.command('new', async ctx => {
+  if (!isAllowed(ctx)) return
+  await ctx.reply('🔄 restarting clobster — back in a few seconds')
+  // Detach so we survive the reply flush; systemd will kill us and respawn.
+  setTimeout(() => { void systemctlUser('restart', SERVICE) }, 250)
+})
+
+bot.command('stop', async ctx => {
+  if (!isAllowed(ctx)) return
+  await ctx.reply('🛑 stopping clobster. Use `systemctl --user start clobster.service` to wake me.')
+  setTimeout(() => { void systemctlUser('stop', SERVICE) }, 250)
+})
+
+// Model / effort switches — inject the built-in slash command into the live
+// tmux pane. No restart, session state preserved.
+const TMUX_TARGET = 'clobster'
+async function tmuxSend(line: string): Promise<{ ok: boolean; err?: string }> {
+  try {
+    await pexec('tmux', ['send-keys', '-t', TMUX_TARGET, line, 'Enter'])
+    return { ok: true }
+  } catch (e: any) {
+    return { ok: false, err: e?.message ?? String(e) }
+  }
+}
+
+for (const alias of ['opus', 'sonnet', 'haiku'] as const) {
+  bot.command(alias, async ctx => {
+    if (!isAllowed(ctx)) return
+    const r = await tmuxSend(`/model ${alias}`)
+    await ctx.reply(r.ok ? `🤖 switched to ${alias}` : `failed: ${r.err}`)
+  })
+}
+
+bot.command('fast', async ctx => {
+  if (!isAllowed(ctx)) return
+  const r = await tmuxSend('/fast')
+  await ctx.reply(r.ok ? '⚡ toggled /fast' : `failed: ${r.err}`)
+})
+
+bot.command('effort', async ctx => {
+  if (!isAllowed(ctx)) return
+  const arg = (ctx.match ?? '').toString().trim().toLowerCase()
+  if (!['low', 'medium', 'high', 'max'].includes(arg)) {
+    await ctx.reply('usage: /effort <low|medium|high|max>')
+    return
+  }
+  const r = await tmuxSend(`/effort ${arg}`)
+  await ctx.reply(r.ok ? `🧠 effort → ${arg}` : `failed: ${r.err}`)
+})
+
+// Tail the systemd journal — for when the agent is wedged and you need to
+// know why. Arg: number of lines (default 30, capped to 200).
+bot.command('log', async ctx => {
+  if (!isAllowed(ctx)) return
+  const raw = (ctx.match ?? '').toString().trim()
+  const n = Math.min(Math.max(parseInt(raw, 10) || 30, 1), 200)
+  try {
+    const { stdout } = await pexec('journalctl', ['--user', '-u', SERVICE, '-n', String(n), '--no-pager'])
+    const out = stdout.trim() || '(empty)'
+    const body = out.length > 3800 ? out.slice(-3800) : out
+    await ctx.reply('```\n' + body + '\n```', { parse_mode: 'MarkdownV2' } as any).catch(async () => {
+      await ctx.reply(body)
+    })
+  } catch (e: any) {
+    await ctx.reply(`journalctl failed: ${e?.message ?? e}`)
+  }
+})
+
+// Capture what the live tmux session is actually displaying — invaluable
+// when the agent is stuck mid-tool-call and not replying.
+bot.command('tail', async ctx => {
+  if (!isAllowed(ctx)) return
+  const raw = (ctx.match ?? '').toString().trim()
+  const n = Math.min(Math.max(parseInt(raw, 10) || 40, 1), 200)
+  try {
+    const { stdout } = await pexec('tmux', ['capture-pane', '-t', 'clobster', '-p', '-S', `-${n}`])
+    const out = stdout.replace(/\s+$/g, '') || '(empty pane)'
+    const body = out.length > 3800 ? out.slice(-3800) : out
+    await ctx.reply('```\n' + body + '\n```', { parse_mode: 'MarkdownV2' } as any).catch(async () => {
+      await ctx.reply(body)
+    })
+  } catch (e: any) {
+    await ctx.reply(`tmux capture-pane failed: ${e?.message ?? e}`)
+  }
 })
 
 // Inline-button handler for permission requests. Callback data is
@@ -770,11 +1006,17 @@ bot.on('callback_query:data', async ctx => {
   pendingPermissions.delete(request_id)
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   await ctx.answerCallbackQuery({ text: label }).catch(() => {})
-  // Replace buttons with the outcome so the same request can't be answered
-  // twice and the chat history shows what was chosen.
-  const msg = ctx.callbackQuery.message
-  if (msg && 'text' in msg && msg.text) {
-    await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
+  // Clobster patch: delete the prompt message on click instead of editing it
+  // to show the outcome. Keeps chat uncluttered. The callback-query toast
+  // ("✅ Allowed") already confirms the action to the user. If the delete fails
+  // (e.g. message >48h old, Telegram's delete window), fall back to edit.
+  try {
+    await ctx.deleteMessage()
+  } catch {
+    const msg = ctx.callbackQuery.message
+    if (msg && 'text' in msg && msg.text) {
+      await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
+    }
   }
 })
 
@@ -952,12 +1194,21 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  // Telegram bot commands must be [a-z0-9_], but Claude Code skills use
+  // hyphenated names (/wrap-up, /quick-capture). Rewrite the underscore
+  // variants so autocomplete works on the Telegram side while the skill
+  // trigger fires on the Claude side.
+  const rewrittenText = text.replace(
+    /^\/(wrap_up|quick_capture)\b/,
+    (_, cmd: string) => '/' + cmd.replace('_', '-'),
+  )
+
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
-      content: text,
+      content: rewrittenText,
       meta: {
         chat_id,
         ...(msgId != null ? { message_id: String(msgId) } : {}),
@@ -985,17 +1236,14 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
-// Retry polling with backoff on any error. Previously only 409 was retried —
-// a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
-// returned, and polling stopped permanently while the process stayed alive
-// (MCP stdin keeps it running). Outbound tools kept working but the bot was
-// deaf to inbound messages until a full restart.
+// 409 Conflict = another getUpdates consumer is still active (zombie from a
+// previous session, or a second Claude Code instance). Retry with backoff
+// until the slot frees up instead of crashing on the first rejection.
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
         onStart: info => {
-          attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           void bot.api.setMyCommands(
@@ -1003,6 +1251,13 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              { command: 'ping', description: 'Liveness check (systemd state, uptime)' },
+              { command: 'ctx', description: 'Context %, model, rate limits, cost' },
+              { command: 'new', description: 'Restart the agent with a fresh session' },
+              { command: 'stop', description: 'Stop the agent (no auto-restart)' },
+              { command: 'peek', description: 'Snapshot of the tmux session (debug view)' },
+              { command: 'wrap_up', description: 'Flush decisions, update memory, commit vault' },
+              { command: 'quick_capture', description: 'Append a note to today\'s inbox' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
@@ -1011,22 +1266,28 @@ void (async () => {
       return // bot.stop() was called — clean exit from the loop
     } catch (err) {
       if (shuttingDown) return
+      if (err instanceof GrammyError && err.error_code === 409) {
+        if (attempt >= 8) {
+          process.stderr.write(
+            `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
+            `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
+          )
+          return
+        }
+        const delay = Math.min(1000 * attempt, 15000)
+        const detail = attempt === 1
+          ? ' — another instance is polling (zombie session, or a second Claude Code running?)'
+          : ''
+        process.stderr.write(
+          `telegram channel: 409 Conflict${detail}, retrying in ${delay / 1000}s\n`,
+        )
+        await new Promise(r => setTimeout(r, delay))
+        continue
+      }
       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
       if (err instanceof Error && err.message === 'Aborted delay') return
-      const is409 = err instanceof GrammyError && err.error_code === 409
-      if (is409 && attempt >= 8) {
-        process.stderr.write(
-          `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
-        )
-        return
-      }
-      const delay = Math.min(1000 * attempt, 15000)
-      const detail = is409
-        ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
-        : `polling error: ${err}`
-      process.stderr.write(`telegram channel: ${detail}, retrying in ${delay / 1000}s\n`)
-      await new Promise(r => setTimeout(r, delay))
+      process.stderr.write(`telegram channel: polling failed: ${err}\n`)
+      return
     }
   }
 })()
