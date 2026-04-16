@@ -59,17 +59,29 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // Telegram allows exactly one getUpdates consumer per token. If a previous
 // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
 // survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
+// 409 Conflict. Kill stale holders — but yield to healthy concurrent pollers.
+//
+// Why "yield": Claude Code spawns one MCP subprocess per claude invocation.
+// Headless one-shot calls (`claude --print`, crons, hooks) therefore spawn a
+// second bun alongside the long-lived session's bun. The old logic SIGTERM'd
+// the long-lived poller on every one-shot, killing inbound delivery silently.
+// Now: if the PID in the file is alive, we run tool-only (no polling); if
+// dead, we take over.
+let SHOULD_POLL = true
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
+    try {
+      process.kill(stale, 0)
+      SHOULD_POLL = false
+      process.stderr.write(`telegram channel: poller pid=${stale} is healthy, running tool-only\n`)
+    } catch {
+      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+    }
   }
 } catch {}
-writeFileSync(PID_FILE, String(process.pid))
+if (SHOULD_POLL) writeFileSync(PID_FILE, String(process.pid))
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -1239,7 +1251,9 @@ bot.catch(err => {
 // 409 Conflict = another getUpdates consumer is still active (zombie from a
 // previous session, or a second Claude Code instance). Retry with backoff
 // until the slot frees up instead of crashing on the first rejection.
-void (async () => {
+if (!SHOULD_POLL) {
+  process.stderr.write(`telegram channel: tool-only mode, skipping bot.start()\n`)
+} else void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
