@@ -68,38 +68,57 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 //
 // Staleness protocol: the poller touches PID_FILE's mtime every 10s. On
 // startup we only yield if (a) the PID is alive AND (b) the file's mtime is
-// fresh (<PID_FRESHNESS_SEC old). This closes a startup race during
-// `systemctl restart` where the outgoing bun was briefly still alive when
-// the new bun read PID_FILE, causing an inherited-yield that lasted forever.
+// fresh (<PID_FRESHNESS_SEC old). If we yield, a watchdog re-checks every
+// PROMOTION_CHECK_MS and promotes this process to poller as soon as the
+// previous holder dies or stops heartbeating — closes the `systemctl restart`
+// race where the outgoing bun was still alive-and-fresh when the new bun read
+// PID_FILE, then died 1-2s later, leaving the new bun tool-only forever.
 const PID_FRESHNESS_SEC = 20
 const PID_TOUCH_INTERVAL_MS = 10000
+const PROMOTION_CHECK_MS = 5000
 let SHOULD_POLL = true
+let yieldedTo: number | null = null
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  const ageSec = (Date.now() - statSync(PID_FILE).mtimeMs) / 1000
-  if (stale > 1 && stale !== process.pid && ageSec < PID_FRESHNESS_SEC) {
-    try {
-      process.kill(stale, 0)
-      SHOULD_POLL = false
-      process.stderr.write(`telegram channel: poller pid=${stale} is fresh (${ageSec.toFixed(1)}s), running tool-only\n`)
-    } catch {
-      process.stderr.write(`telegram channel: replacing stale poller pid=${stale} (alive but dying)\n`)
-    }
-  } else if (stale > 1 && stale !== process.pid) {
-    process.stderr.write(`telegram channel: taking over from pid=${stale} (heartbeat ${ageSec.toFixed(0)}s stale, threshold ${PID_FRESHNESS_SEC}s)\n`)
-  }
-} catch {}
-if (SHOULD_POLL) {
+
+// Returns holder pid if slot is held by a fresh+alive peer we should yield to,
+// otherwise null (file missing, stale, pointing at dead pid, or to ourselves).
+function checkPidSlot(): number | null {
+  try {
+    const holder = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (!(holder > 1) || holder === process.pid) return null
+    const ageSec = (Date.now() - statSync(PID_FILE).mtimeMs) / 1000
+    if (ageSec >= PID_FRESHNESS_SEC) return null
+    try { process.kill(holder, 0) } catch { return null }
+    return holder
+  } catch { return null }
+}
+
+function startPidHeartbeat() {
   writeFileSync(PID_FILE, String(process.pid))
-  // Heartbeat the pid file so peer bun instances can tell we're a live poller
-  // vs a dead-but-pid-file-still-there race. utimesSync bumps mtime cheaply.
   setInterval(() => {
     try {
       const now = Date.now() / 1000
       utimesSync(PID_FILE, now, now)
     } catch {}
   }, PID_TOUCH_INTERVAL_MS).unref()
+}
+
+yieldedTo = checkPidSlot()
+if (yieldedTo !== null) {
+  SHOULD_POLL = false
+  const ageSec = (Date.now() - statSync(PID_FILE).mtimeMs) / 1000
+  process.stderr.write(`telegram channel: poller pid=${yieldedTo} is fresh (${ageSec.toFixed(1)}s), running tool-only\n`)
+} else {
+  try {
+    const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (stale > 1 && stale !== process.pid) {
+      process.stderr.write(`telegram channel: taking over from pid=${stale} (stale or dead)\n`)
+    }
+  } catch {}
+}
+
+if (SHOULD_POLL) {
+  startPidHeartbeat()
 }
 
 // Last-resort safety net — without these the process dies silently on any
@@ -1270,9 +1289,7 @@ bot.catch(err => {
 // 409 Conflict = another getUpdates consumer is still active (zombie from a
 // previous session, or a second Claude Code instance). Retry with backoff
 // until the slot frees up instead of crashing on the first rejection.
-if (!SHOULD_POLL) {
-  process.stderr.write(`telegram channel: tool-only mode, skipping bot.start()\n`)
-} else void (async () => {
+async function runPollingLoop() {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
@@ -1319,4 +1336,22 @@ if (!SHOULD_POLL) {
       return
     }
   }
-})()
+}
+
+if (!SHOULD_POLL) {
+  process.stderr.write(`telegram channel: tool-only mode, skipping bot.start()\n`)
+  // Promotion watchdog. If we yielded to a peer at startup but that peer dies
+  // or stops heartbeating, take over — otherwise an inherited-yield keeps us
+  // tool-only forever (observed after clobster.service double-restart).
+  const promotionTimer = setInterval(() => {
+    if (shuttingDown) { clearInterval(promotionTimer); return }
+    const holder = checkPidSlot()
+    if (holder !== null) return // peer still healthy
+    clearInterval(promotionTimer)
+    SHOULD_POLL = true
+    process.stderr.write(`telegram channel: promoting self to poller (previous pid=${yieldedTo} gone or stale)\n`)
+    startPidHeartbeat()
+    void runPollingLoop()
+  }, PROMOTION_CHECK_MS)
+  promotionTimer.unref()
+} else void runPollingLoop()
