@@ -19,7 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, utimesSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { execFile } from 'child_process'
@@ -65,23 +65,42 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // Headless one-shot calls (`claude --print`, crons, hooks) therefore spawn a
 // second bun alongside the long-lived session's bun. The old logic SIGTERM'd
 // the long-lived poller on every one-shot, killing inbound delivery silently.
-// Now: if the PID in the file is alive, we run tool-only (no polling); if
-// dead, we take over.
+//
+// Staleness protocol: the poller touches PID_FILE's mtime every 10s. On
+// startup we only yield if (a) the PID is alive AND (b) the file's mtime is
+// fresh (<PID_FRESHNESS_SEC old). This closes a startup race during
+// `systemctl restart` where the outgoing bun was briefly still alive when
+// the new bun read PID_FILE, causing an inherited-yield that lasted forever.
+const PID_FRESHNESS_SEC = 20
+const PID_TOUCH_INTERVAL_MS = 10000
 let SHOULD_POLL = true
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
+  const ageSec = (Date.now() - statSync(PID_FILE).mtimeMs) / 1000
+  if (stale > 1 && stale !== process.pid && ageSec < PID_FRESHNESS_SEC) {
     try {
       process.kill(stale, 0)
       SHOULD_POLL = false
-      process.stderr.write(`telegram channel: poller pid=${stale} is healthy, running tool-only\n`)
+      process.stderr.write(`telegram channel: poller pid=${stale} is fresh (${ageSec.toFixed(1)}s), running tool-only\n`)
     } catch {
-      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+      process.stderr.write(`telegram channel: replacing stale poller pid=${stale} (alive but dying)\n`)
     }
+  } else if (stale > 1 && stale !== process.pid) {
+    process.stderr.write(`telegram channel: taking over from pid=${stale} (heartbeat ${ageSec.toFixed(0)}s stale, threshold ${PID_FRESHNESS_SEC}s)\n`)
   }
 } catch {}
-if (SHOULD_POLL) writeFileSync(PID_FILE, String(process.pid))
+if (SHOULD_POLL) {
+  writeFileSync(PID_FILE, String(process.pid))
+  // Heartbeat the pid file so peer bun instances can tell we're a live poller
+  // vs a dead-but-pid-file-still-there race. utimesSync bumps mtime cheaply.
+  setInterval(() => {
+    try {
+      const now = Date.now() / 1000
+      utimesSync(PID_FILE, now, now)
+    } catch {}
+  }, PID_TOUCH_INTERVAL_MS).unref()
+}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -1281,20 +1300,16 @@ if (!SHOULD_POLL) {
     } catch (err) {
       if (shuttingDown) return
       if (err instanceof GrammyError && err.error_code === 409) {
-        if (attempt >= 8) {
+        // Never give up. Another poller (zombie session, openclaw-gateway during
+        // the Clobster migration, a second Claude Code) holds the getUpdates slot.
+        // Retry forever with exponential backoff capped at 60s — the moment the
+        // other poller dies, we claim the token. Giving up leaves Clobster mute.
+        const delay = Math.min(1000 * 2 ** Math.min(attempt - 1, 6), 60000)
+        if (attempt === 1 || attempt % 10 === 0) {
           process.stderr.write(
-            `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-            `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
+            `telegram channel: 409 Conflict on attempt ${attempt} — another poller holds the token, retrying in ${delay / 1000}s\n`,
           )
-          return
         }
-        const delay = Math.min(1000 * attempt, 15000)
-        const detail = attempt === 1
-          ? ' — another instance is polling (zombie session, or a second Claude Code running?)'
-          : ''
-        process.stderr.write(
-          `telegram channel: 409 Conflict${detail}, retrying in ${delay / 1000}s\n`,
-        )
         await new Promise(r => setTimeout(r, delay))
         continue
       }
