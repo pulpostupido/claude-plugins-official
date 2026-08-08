@@ -787,7 +787,7 @@ bot.command('help', async ctx => {
     `/ping — liveness check (systemd state, uptime)\n` +
     `/ctx — context %, model, rate limits, cost\n` +
     `/peek [N|full] — snapshot the live tmux pane\n` +
-    `/opus, /sonnet, /haiku — switch model\n` +
+    `/opus, /sonnet, /haiku, /fable — switch model\n` +
     `/fast — toggle fast mode\n` +
     `/effort <low|medium|high|max> — reasoning effort\n` +
     `/new — restart with a fresh session\n` +
@@ -965,7 +965,7 @@ async function tmuxSend(line: string): Promise<{ ok: boolean; err?: string }> {
   }
 }
 
-for (const alias of ['opus', 'sonnet', 'haiku'] as const) {
+for (const alias of ['opus', 'sonnet', 'haiku', 'fable'] as const) {
   bot.command(alias, async ctx => {
     if (!isAllowed(ctx)) return
     const r = await tmuxSend(`/model ${alias}`)
@@ -1438,11 +1438,23 @@ async function runPollingLoop() {
               { command: 'status', description: 'Check your pairing status' },
               { command: 'ping', description: 'Liveness check (systemd state, uptime)' },
               { command: 'ctx', description: 'Context %, model, rate limits, cost' },
+              { command: 'opus', description: 'Switch model to Opus' },
+              { command: 'sonnet', description: 'Switch model to Sonnet' },
+              { command: 'haiku', description: 'Switch model to Haiku' },
+              { command: 'fable', description: 'Switch model to Fable' },
+              { command: 'fast', description: 'Toggle fast mode' },
+              { command: 'effort', description: 'Set reasoning effort (low/medium/high/max)' },
               { command: 'new', description: 'Restart the agent with a fresh session' },
-              { command: 'stop', description: 'Stop the agent (no auto-restart)' },
+              { command: 'stop', description: 'Interrupt the current turn (sends Esc)' },
+              { command: 'halt', description: 'Stop the agent (no auto-restart)' },
+              { command: 'log', description: 'Tail the systemd journal' },
+              { command: 'tail', description: 'Capture the live tmux pane' },
               { command: 'peek', description: 'Snapshot of the tmux session (debug view)' },
               { command: 'wrap_up', description: 'Flush decisions, update memory, commit vault' },
               { command: 'quick_capture', description: 'Append a note to today\'s inbox' },
+              { command: 'private_on', description: 'Go off the record — nothing saved' },
+              { command: 'private_off', description: 'Back on the record — scrub the private window' },
+              { command: 'private_status', description: 'Check if private mode is on' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
