@@ -965,11 +965,42 @@ async function tmuxSend(line: string): Promise<{ ok: boolean; err?: string }> {
   }
 }
 
+// A `/model` switch on a session with cached context raises a SECOND,
+// interactive prompt ("Switch model? … 1. Yes / 2. No") that blocks the pane
+// until a key is pressed. Nobody is at the TUI when the switch came from
+// Telegram, so every later message queues behind it and the bot looks dead
+// (MON-423). Poll the pane and answer it. Never send C-c here.
+async function answerModelDialog(): Promise<boolean> {
+  for (let i = 0; i < 8; i++) {
+    await new Promise(r => setTimeout(r, 500))
+    let pane = ''
+    try {
+      const { stdout } = await pexec('tmux', ['capture-pane', '-p', '-t', TMUX_TARGET, '-S', '-40'])
+      pane = stdout
+    } catch { continue }
+    if (/Switch model\?/i.test(pane) && /1\.\s*Yes, switch to/i.test(pane)) {
+      try {
+        await pexec('tmux', ['send-keys', '-t', TMUX_TARGET, '1', 'Enter'])
+        return true
+      } catch { return false }
+    }
+  }
+  return false
+}
+
 for (const alias of ['opus', 'sonnet', 'haiku', 'fable'] as const) {
   bot.command(alias, async ctx => {
     if (!isAllowed(ctx)) return
     const r = await tmuxSend(`/model ${alias}`)
-    await ctx.reply(r.ok ? `🤖 switched to ${alias}` : `failed: ${r.err}`)
+    if (!r.ok) {
+      await ctx.reply(`failed: ${r.err}`)
+      return
+    }
+    const confirmed = await answerModelDialog()
+    await ctx.reply(
+      `🤖 switched to ${alias}${confirmed ? ' (confirmed cache-invalidation prompt)' : ''}\n` +
+        `⚠️ live session only — run \`clobster-model ${alias}\` to survive a restart`,
+    )
   })
 }
 
