@@ -442,8 +442,10 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 }
 
 // .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
+// .oga/.ogg/.opus go as voice notes (waveform, inline playback, CarPlay-friendly);
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
+const VOICE_EXTS = new Set(['.oga', '.ogg', '.opus'])
 
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
@@ -465,7 +467,7 @@ const mcp = new Server(
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. OGG opus files (.oga/.ogg/.opus) render as voice notes — use ~/bin/pedro-speak to synthesize voice replies for driving/hands-free contexts. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -526,7 +528,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
+            description: 'Absolute file paths to attach. Images (.jpg/.png/.gif/.webp) send as photos (inline preview); .oga/.ogg/.opus send as voice notes (waveform + inline playback — CarPlay-friendly); other types as documents. Max 50MB each.',
           },
           format: {
             type: 'string',
@@ -646,6 +648,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             : undefined
           if (PHOTO_EXTS.has(ext)) {
             const sent = await retryingSend(() => bot.api.sendPhoto(chat_id, input, opts), 'sendPhoto')
+            sentIds.push(sent.message_id)
+          } else if (VOICE_EXTS.has(ext)) {
+            const sent = await retryingSend(() => bot.api.sendVoice(chat_id, input, opts), 'sendVoice')
             sentIds.push(sent.message_id)
           } else {
             const sent = await retryingSend(() => bot.api.sendDocument(chat_id, input, opts), 'sendDocument')
@@ -781,11 +786,13 @@ bot.command('help', async ctx => {
     `/status — check your pairing state\n` +
     `/ping — liveness check (systemd state, uptime)\n` +
     `/ctx — context %, model, rate limits, cost\n` +
-    `/opus, /sonnet, /haiku — switch model\n` +
+    `/peek [N|full] — snapshot the live tmux pane\n` +
+    `/opus, /sonnet, /haiku, /fable — switch model\n` +
     `/fast — toggle fast mode\n` +
     `/effort <low|medium|high|max> — reasoning effort\n` +
     `/new — restart with a fresh session\n` +
-    `/stop — stop the agent (no auto-restart)`
+    `/stop — send Esc: interrupt current turn so you can redirect\n` +
+    `/halt — stop the agent (no auto-restart; use to fully shut down)`
   )
 })
 
@@ -818,7 +825,7 @@ bot.command('status', async ctx => {
 // These are intercepted at the bot layer and never reach the Claude session,
 // so they keep working even if the agent is wedged.
 
-const SERVICE = 'clobster.service'
+const SERVICE = 'pedro.service'
 const STATUS_FILE = join(STATE_DIR, 'status.json')
 
 function isAllowed(ctx: Context): boolean {
@@ -921,20 +928,34 @@ bot.command('ctx', async ctx => {
 
 bot.command('new', async ctx => {
   if (!isAllowed(ctx)) return
-  await ctx.reply('🔄 restarting clobster — back in a few seconds')
+  await ctx.reply('🔄 restarting pedro — back in a few seconds')
   // Detach so we survive the reply flush; systemd will kill us and respawn.
   setTimeout(() => { void systemctlUser('restart', SERVICE) }, 250)
 })
 
+// /stop now behaves like pressing Escape in the CC tmux pane: it interrupts the
+// current turn without killing the service, so William can redirect or add
+// context mid-operation and resume with the very next message.
+// For a hard service-stop, use `/halt` (below) or `systemctl --user stop` from a shell.
 bot.command('stop', async ctx => {
   if (!isAllowed(ctx)) return
-  await ctx.reply('🛑 stopping clobster. Use `systemctl --user start clobster.service` to wake me.')
+  try {
+    await pexec('tmux', ['send-keys', '-t', 'pedro', 'Escape'])
+    await ctx.reply('🛑 Esc sent — current turn interrupted. Send your next message to redirect.')
+  } catch (e: any) {
+    await ctx.reply(`failed: ${e?.message ?? String(e)}`)
+  }
+})
+
+bot.command('halt', async ctx => {
+  if (!isAllowed(ctx)) return
+  await ctx.reply('💤 halting pedro.service (no auto-restart). Use `systemctl --user start pedro.service` to wake me.')
   setTimeout(() => { void systemctlUser('stop', SERVICE) }, 250)
 })
 
 // Model / effort switches — inject the built-in slash command into the live
 // tmux pane. No restart, session state preserved.
-const TMUX_TARGET = 'clobster'
+const TMUX_TARGET = 'pedro'
 async function tmuxSend(line: string): Promise<{ ok: boolean; err?: string }> {
   try {
     await pexec('tmux', ['send-keys', '-t', TMUX_TARGET, line, 'Enter'])
@@ -944,11 +965,42 @@ async function tmuxSend(line: string): Promise<{ ok: boolean; err?: string }> {
   }
 }
 
-for (const alias of ['opus', 'sonnet', 'haiku'] as const) {
+// A `/model` switch on a session with cached context raises a SECOND,
+// interactive prompt ("Switch model? … 1. Yes / 2. No") that blocks the pane
+// until a key is pressed. Nobody is at the TUI when the switch came from
+// Telegram, so every later message queues behind it and the bot looks dead
+// (MON-423). Poll the pane and answer it. Never send C-c here.
+async function answerModelDialog(): Promise<boolean> {
+  for (let i = 0; i < 8; i++) {
+    await new Promise(r => setTimeout(r, 500))
+    let pane = ''
+    try {
+      const { stdout } = await pexec('tmux', ['capture-pane', '-p', '-t', TMUX_TARGET, '-S', '-40'])
+      pane = stdout
+    } catch { continue }
+    if (/Switch model\?/i.test(pane) && /1\.\s*Yes, switch to/i.test(pane)) {
+      try {
+        await pexec('tmux', ['send-keys', '-t', TMUX_TARGET, '1', 'Enter'])
+        return true
+      } catch { return false }
+    }
+  }
+  return false
+}
+
+for (const alias of ['opus', 'sonnet', 'haiku', 'fable'] as const) {
   bot.command(alias, async ctx => {
     if (!isAllowed(ctx)) return
     const r = await tmuxSend(`/model ${alias}`)
-    await ctx.reply(r.ok ? `🤖 switched to ${alias}` : `failed: ${r.err}`)
+    if (!r.ok) {
+      await ctx.reply(`failed: ${r.err}`)
+      return
+    }
+    const confirmed = await answerModelDialog()
+    await ctx.reply(
+      `🤖 switched to ${alias}${confirmed ? ' (confirmed cache-invalidation prompt)' : ''}\n` +
+        `⚠️ live session only — run \`pedro-model ${alias}\` to survive a restart`,
+    )
   })
 }
 
@@ -994,7 +1046,7 @@ bot.command('tail', async ctx => {
   const raw = (ctx.match ?? '').toString().trim()
   const n = Math.min(Math.max(parseInt(raw, 10) || 40, 1), 200)
   try {
-    const { stdout } = await pexec('tmux', ['capture-pane', '-t', 'clobster', '-p', '-S', `-${n}`])
+    const { stdout } = await pexec('tmux', ['capture-pane', '-t', 'pedro', '-p', '-S', `-${n}`])
     const out = stdout.replace(/\s+$/g, '') || '(empty pane)'
     const body = out.length > 3800 ? out.slice(-3800) : out
     await ctx.reply('```\n' + body + '\n```', { parse_mode: 'MarkdownV2' } as any).catch(async () => {
@@ -1002,6 +1054,73 @@ bot.command('tail', async ctx => {
     })
   } catch (e: any) {
     await ctx.reply(`tmux capture-pane failed: ${e?.message ?? e}`)
+  }
+})
+
+// /peek — snapshot of the live tmux pane. Ported from the peek skill so it
+// runs entirely in the bot (instant, no Claude round-trip).
+//   /peek       → visible pane only  (~50 lines)
+//   /peek N     → last N lines of scrollback
+//   /peek full  → entire scrollback
+// ≤3500 chars go inline as a code block; larger captures ship as an attachment.
+bot.command('peek', async ctx => {
+  if (!isAllowed(ctx)) return
+  const raw = (ctx.match ?? '').toString().trim().toLowerCase()
+  let args: string[]
+  let mode: string
+  if (raw === '') {
+    args = ['capture-pane', '-t', 'pedro', '-p', '-J']
+    mode = 'visible pane'
+  } else if (raw === 'full') {
+    args = ['capture-pane', '-t', 'pedro', '-p', '-J', '-S', '-', '-E', '-']
+    mode = 'full scrollback'
+  } else {
+    const parsed = parseInt(raw, 10)
+    if (Number.isFinite(parsed) && parsed > 0) {
+      const n = Math.min(parsed, 10000)
+      args = ['capture-pane', '-t', 'pedro', '-p', '-J', '-S', `-${n}`, '-E', '-']
+      mode = `last ${n} lines`
+    } else {
+      // Unrecognized arg → fall through to visible-pane default.
+      args = ['capture-pane', '-t', 'pedro', '-p', '-J']
+      mode = 'visible pane'
+    }
+  }
+
+  let stdout: string
+  try {
+    ({ stdout } = await pexec('tmux', args))
+  } catch (e: any) {
+    const msg = e?.stderr?.toString?.().trim() || e?.message || String(e)
+    await ctx.reply(`tmux capture-pane failed: ${msg}`)
+    return
+  }
+
+  const body = stdout.replace(/\s+$/g, '')
+  const lineCount = body ? body.split('\n').length : 0
+  const header = `🖥 tmux pedro — ${mode}${lineCount ? `, ${lineCount} lines` : ''}`
+
+  if (!body) {
+    await ctx.reply(`${header}\n\n(empty pane)`)
+    return
+  }
+
+  if (body.length <= 3500) {
+    const message = `${header}\n\`\`\`\n${body}\n\`\`\``
+    await ctx.reply(message, { parse_mode: 'MarkdownV2' } as any).catch(async () => {
+      await ctx.reply(`${header}\n\n${body}`)
+    })
+    return
+  }
+
+  const path = `/tmp/peek-${Date.now()}.txt`
+  try {
+    writeFileSync(path, body)
+    await ctx.replyWithDocument(new InputFile(path), {
+      caption: `${header} (attached, ${body.length} chars)`,
+    })
+  } catch (e: any) {
+    await ctx.reply(`peek attachment failed: ${e?.message ?? e}`)
   }
 })
 
@@ -1115,26 +1234,26 @@ bot.on('message:document', async ctx => {
 
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
-  const text = ctx.message.caption ?? '(voice message)'
-  await handleInbound(ctx, text, undefined, {
+  const fallbackText = ctx.message.caption ?? '(voice message)'
+  await handleInbound(ctx, fallbackText, undefined, {
     kind: 'voice',
     file_id: voice.file_id,
     size: voice.file_size,
     mime: voice.mime_type,
-  })
+  }, () => transcribeFileId(voice.file_id, 'oga'))
 })
 
 bot.on('message:audio', async ctx => {
   const audio = ctx.message.audio
   const name = safeName(audio.file_name)
-  const text = ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`
-  await handleInbound(ctx, text, undefined, {
+  const fallbackText = ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`
+  await handleInbound(ctx, fallbackText, undefined, {
     kind: 'audio',
     file_id: audio.file_id,
     size: audio.file_size,
     mime: audio.mime_type,
     name,
-  })
+  }, () => transcribeFileId(audio.file_id, extFromMime(audio.mime_type) ?? 'mp3'))
 })
 
 bot.on('message:video', async ctx => {
@@ -1183,11 +1302,53 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// Local Whisper transcription via ~/bin/pedro-transcribe.
+// Returns the transcript on success, undefined on silence / error.
+// Spawned per-message — model load (~4s) + transcription cost lives here, not in Claude's turn.
+async function transcribeFileId(file_id: string, extHint: string): Promise<string | undefined> {
+  let path: string | undefined
+  try {
+    const file = await bot.api.getFile(file_id)
+    if (!file.file_path) return undefined
+    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+    const res = await fetch(url)
+    if (!res.ok) return undefined
+    const buf = Buffer.from(await res.arrayBuffer())
+    const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : extHint
+    const ext = (rawExt.replace(/[^a-zA-Z0-9]/g, '') || extHint || 'bin')
+    const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'voice'
+    path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+    mkdirSync(INBOX_DIR, { recursive: true })
+    writeFileSync(path, buf)
+  } catch (err) {
+    process.stderr.write(`telegram channel: voice download failed: ${err}\n`)
+    return undefined
+  }
+  try {
+    const { stdout } = await pexec('/home/pedro/bin/pedro-transcribe', [path], {
+      timeout: 120_000,
+      maxBuffer: 1024 * 1024,
+    })
+    const t = stdout.trim()
+    return t.length > 0 ? t : undefined
+  } catch (err) {
+    process.stderr.write(`telegram channel: transcribe failed: ${err}\n`)
+    return undefined
+  }
+}
+
+function extFromMime(mime: string | undefined): string | undefined {
+  if (!mime) return undefined
+  const m = mime.match(/^audio\/([a-zA-Z0-9]+)/)
+  return m?.[1]
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
+  transcribe?: () => Promise<string | undefined>,
 ): Promise<void> {
   const result = gate(ctx)
 
@@ -1244,11 +1405,16 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  // Voice/audio: transcribe locally and use the transcript as the message text.
+  // Falls through to fallback text on silence or error so Claude still sees something.
+  const transcript = transcribe ? await transcribe() : undefined
+  const effectiveText = transcript ? `[\u{1F399}\uFE0F voice]: ${transcript}` : text
+
   // Telegram bot commands must be [a-z0-9_], but Claude Code skills use
   // hyphenated names (/wrap-up, /quick-capture). Rewrite the underscore
   // variants so autocomplete works on the Telegram side while the skill
   // trigger fires on the Claude side.
-  const rewrittenText = text.replace(
+  const rewrittenText = effectiveText.replace(
     /^\/(wrap_up|quick_capture)\b/,
     (_, cmd: string) => '/' + cmd.replace('_', '-'),
   )
@@ -1303,11 +1469,23 @@ async function runPollingLoop() {
               { command: 'status', description: 'Check your pairing status' },
               { command: 'ping', description: 'Liveness check (systemd state, uptime)' },
               { command: 'ctx', description: 'Context %, model, rate limits, cost' },
+              { command: 'opus', description: 'Switch model to Opus' },
+              { command: 'sonnet', description: 'Switch model to Sonnet' },
+              { command: 'haiku', description: 'Switch model to Haiku' },
+              { command: 'fable', description: 'Switch model to Fable' },
+              { command: 'fast', description: 'Toggle fast mode' },
+              { command: 'effort', description: 'Set reasoning effort (low/medium/high/max)' },
               { command: 'new', description: 'Restart the agent with a fresh session' },
-              { command: 'stop', description: 'Stop the agent (no auto-restart)' },
+              { command: 'stop', description: 'Interrupt the current turn (sends Esc)' },
+              { command: 'halt', description: 'Stop the agent (no auto-restart)' },
+              { command: 'log', description: 'Tail the systemd journal' },
+              { command: 'tail', description: 'Capture the live tmux pane' },
               { command: 'peek', description: 'Snapshot of the tmux session (debug view)' },
               { command: 'wrap_up', description: 'Flush decisions, update memory, commit vault' },
               { command: 'quick_capture', description: 'Append a note to today\'s inbox' },
+              { command: 'private_on', description: 'Go off the record — nothing saved' },
+              { command: 'private_off', description: 'Back on the record — scrub the private window' },
+              { command: 'private_status', description: 'Check if private mode is on' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
@@ -1342,7 +1520,7 @@ if (!SHOULD_POLL) {
   process.stderr.write(`telegram channel: tool-only mode, skipping bot.start()\n`)
   // Promotion watchdog. If we yielded to a peer at startup but that peer dies
   // or stops heartbeating, take over — otherwise an inherited-yield keeps us
-  // tool-only forever (observed after clobster.service double-restart).
+  // tool-only forever (observed after pedro.service double-restart).
   const promotionTimer = setInterval(() => {
     if (shuttingDown) { clearInterval(promotionTimer); return }
     const holder = checkPidSlot()
