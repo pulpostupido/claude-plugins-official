@@ -24,6 +24,7 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
+import { Outbox, classifySendError, computeBackoff, OUTBOX_MAX_ATTEMPTS, type OutboxPayload, type OutboxEntry } from './outbox'
 const pexec = promisify(execFile)
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -55,6 +56,8 @@ if (!TOKEN) {
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
+const OUTBOX_FILE = join(STATE_DIR, 'outbox.json')
+const outbox = new Outbox(OUTBOX_FILE)
 
 // Telegram allows exactly one getUpdates consumer per token. If a previous
 // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
@@ -139,30 +142,68 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const bot = new Bot(TOKEN)
 let botUsername = ''
 
-// Outbound retry. 429 honors Telegram's retry_after; 5xx and network errors
-// get exponential backoff. 4xx (auth, bad request) fail fast — retry won't help.
-async function retryingSend<T>(fn: () => Promise<T>, label: string): Promise<T> {
-  const delays = [500, 1500, 4000, 8000]
-  for (let i = 0; i <= delays.length; i++) {
+// Outbound send, backed by the durable outbox (outbox.ts). Persists intent
+// before the Bot API call and the outcome after it, so a crash mid-retry or
+// mid-backoff survives as a `pending` record on disk that gets resumed on
+// the next poller startup (see resumeOutboxOnStartup below) — instead of
+// silently vanishing when this process dies. 429 honors Telegram's
+// retry_after; 5xx and network errors get exponential backoff with jitter.
+// 4xx (auth, bad request) fail fast — retry won't help, and the outbox
+// records them as failed-permanent so they stay visible for review.
+async function performOutboxSend(entry: OutboxEntry): Promise<number> {
+  const p = entry.payload
+  if (p.kind === 'text') {
+    const sent = await bot.api.sendMessage(entry.chatId, p.text, {
+      ...(p.replyToMessageId != null ? { reply_parameters: { message_id: p.replyToMessageId } } : {}),
+      ...(p.parseMode ? { parse_mode: p.parseMode } : {}),
+    })
+    return sent.message_id
+  }
+  const input = new InputFile(p.filePath)
+  const opts = p.replyToMessageId != null ? { reply_parameters: { message_id: p.replyToMessageId } } : undefined
+  const sent =
+    p.kind === 'photo' ? await bot.api.sendPhoto(entry.chatId, input, opts)
+    : p.kind === 'voice' ? await bot.api.sendVoice(entry.chatId, input, opts)
+    : await bot.api.sendDocument(entry.chatId, input, opts)
+  return sent.message_id
+}
+
+async function outboxSend(chatId: string, payload: OutboxPayload, label: string): Promise<number> {
+  const entry = outbox.enqueue(chatId, payload)
+  for (let attempt = 1; attempt <= OUTBOX_MAX_ATTEMPTS; attempt++) {
     try {
-      return await fn()
+      const messageId = await performOutboxSend(entry)
+      outbox.recordAttempt(entry.id, { ok: true, messageId })
+      return messageId
     } catch (err) {
-      const isLast = i === delays.length
-      const code = err instanceof GrammyError ? err.error_code : undefined
-      const retryable = code === 429 || (code != null && code >= 500) || code === undefined
-      if (isLast || !retryable) throw err
-      let delay = delays[i]!
-      if (code === 429) {
-        const ra = (err as GrammyError).parameters?.retry_after
-        if (typeof ra === 'number') delay = Math.max(delay, ra * 1000)
-      }
+      const updated = outbox.recordAttempt(entry.id, { ok: false, error: err })
+      if (!updated || updated.status === 'failed-permanent') throw err
+      const { retryAfterMs } = classifySendError(err)
+      const delay = Math.max(computeBackoff(attempt), retryAfterMs ?? 0)
       process.stderr.write(
-        `telegram channel: ${label} failed (${code ?? 'net'}), retry ${i + 1}/${delays.length} in ${delay}ms\n`,
+        `telegram channel: ${label} failed, outbox retry ${attempt}/${OUTBOX_MAX_ATTEMPTS} in ${delay}ms (entry ${entry.id})\n`,
       )
       await new Promise(r => setTimeout(r, delay))
     }
   }
-  throw new Error('unreachable')
+  throw new Error(`${label} exhausted retries (entry ${entry.id})`)
+}
+
+// On poller startup (cold start or promotion after a peer dies — see the
+// yield/promote watchdog below), resend anything the outbox still has
+// marked `pending`: a send whose process died between persisting intent
+// and persisting the outcome. Guards (max age, max attempts) live in
+// outbox.ts; this just wires it to the real Bot API and logs the outcome.
+async function resumeOutboxOnStartup(): Promise<void> {
+  const result = await outbox.resumeOnStartup(performOutboxSend)
+  if (result.resumed > 0) {
+    process.stderr.write(
+      `telegram channel: outbox resume — ${result.resumed} pending found, ` +
+        `${result.acked} acked, ${result.permanentFailed} failed-permanent, ` +
+        `${result.expired} expired, ${result.stillPending} still pending\n`,
+    )
+  }
+  outbox.pruneOld()
 }
 
 type PendingEntry = {
@@ -417,6 +458,12 @@ function checkApprovals(): void {
 
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
 
+// Startup already prunes once (see resumeOutboxOnStartup), but a long-lived
+// poller that never restarts would otherwise let acked/terminal outbox
+// entries accumulate forever. Hourly is plenty — pruning is cheap and safe
+// to run redundantly from multiple processes (tool-only peers included).
+setInterval(() => outbox.pruneOld(), 60 * 60 * 1000).unref()
+
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
 
@@ -622,14 +669,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
-            const sent = await retryingSend(
-              () => bot.api.sendMessage(chat_id, chunks[i], {
-                ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-                ...(parseMode ? { parse_mode: parseMode } : {}),
-              }),
+            const messageId = await outboxSend(
+              chat_id,
+              {
+                kind: 'text',
+                text: chunks[i]!,
+                ...(shouldReplyTo ? { replyToMessageId: reply_to } : {}),
+                ...(parseMode ? { parseMode } : {}),
+              },
               'sendMessage',
             )
-            sentIds.push(sent.message_id)
+            sentIds.push(messageId)
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
@@ -642,20 +692,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // sendMessage call). Thread under reply_to if present.
         for (const f of files) {
           const ext = extname(f).toLowerCase()
-          const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
-          if (PHOTO_EXTS.has(ext)) {
-            const sent = await retryingSend(() => bot.api.sendPhoto(chat_id, input, opts), 'sendPhoto')
-            sentIds.push(sent.message_id)
-          } else if (VOICE_EXTS.has(ext)) {
-            const sent = await retryingSend(() => bot.api.sendVoice(chat_id, input, opts), 'sendVoice')
-            sentIds.push(sent.message_id)
-          } else {
-            const sent = await retryingSend(() => bot.api.sendDocument(chat_id, input, opts), 'sendDocument')
-            sentIds.push(sent.message_id)
-          }
+          const replyToMessageId = reply_to != null && replyMode !== 'off' ? reply_to : undefined
+          const kind = PHOTO_EXTS.has(ext) ? 'photo' as const : VOICE_EXTS.has(ext) ? 'voice' as const : 'document' as const
+          const label = kind === 'photo' ? 'sendPhoto' : kind === 'voice' ? 'sendVoice' : 'sendDocument'
+          const messageId = await outboxSend(chat_id, { kind, filePath: f, replyToMessageId }, label)
+          sentIds.push(messageId)
         }
 
         const result =
@@ -1462,6 +1503,9 @@ async function runPollingLoop() {
         onStart: info => {
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          void resumeOutboxOnStartup().catch(err => {
+            process.stderr.write(`telegram channel: outbox resume failed: ${err}\n`)
+          })
           void bot.api.setMyCommands(
             [
               { command: 'start', description: 'Welcome and setup guide' },
