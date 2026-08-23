@@ -20,7 +20,7 @@ import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'gramm
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, utimesSync } from 'fs'
-import { homedir } from 'os'
+import { homedir, userInfo } from 'os'
 import { join, extname, sep } from 'path'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -28,6 +28,16 @@ import { Outbox, classifySendError, computeBackoff, OUTBOX_MAX_ATTEMPTS, type Ou
 const pexec = promisify(execFile)
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+
+// ── Persona ─────────────────────────────────────────────────────────────────
+// One fork serves every assistant on this box (clobster, pedro, ...): identity
+// derives from the unix user, with env overrides for anything nonstandard.
+const ASSISTANT = process.env.ASSISTANT_NAME ?? userInfo().username
+const SERVICE = process.env.ASSISTANT_SERVICE ?? `${ASSISTANT}.service`
+const TMUX_TARGET = process.env.ASSISTANT_TMUX ?? ASSISTANT
+const SPEAK_BIN = process.env.ASSISTANT_SPEAK_BIN ?? `${ASSISTANT}-speak`
+const MODEL_BIN = process.env.ASSISTANT_MODEL_BIN ?? `${ASSISTANT}-model`
+const TRANSCRIBE_BIN = process.env.ASSISTANT_TRANSCRIBE_BIN ?? join(homedir(), 'bin', `${ASSISTANT}-transcribe`)
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -514,7 +524,7 @@ const mcp = new Server(
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. OGG opus files (.oga/.ogg/.opus) render as voice notes — use ~/bin/clobster-speak to synthesize voice replies for driving/hands-free contexts. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      `reply accepts file paths (files: ["/abs/path.png"]) for attachments. OGG opus files (.oga/.ogg/.opus) render as voice notes — use ~/bin/${SPEAK_BIN} to synthesize voice replies for driving/hands-free contexts. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don't trigger push notifications — when a long task completes, send a new reply so the user's device pings.`,
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -646,6 +656,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           : format === 'html' ? 'HTML' as const
           : undefined
 
+        if (typeof chat_id !== 'string' || !chat_id) throw new Error('reply: required param `chat_id` (string) is missing')
+        if (typeof text !== 'string' || text.length === 0) {
+          throw new Error('reply: required param `text` (string) is missing or empty — check it was not passed under another key (e.g. `message`)')
+        }
         assertAllowedChat(chat_id)
 
         for (const f of files) {
@@ -731,6 +745,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: path }] }
       }
       case 'edit_message': {
+        if (typeof args.text !== 'string' || args.text.length === 0) {
+          throw new Error('edit_message: required param `text` (string) is missing or empty')
+        }
         assertAllowedChat(args.chat_id as string)
         const editFormat = (args.format as string | undefined) ?? 'text'
         const editParseMode =
@@ -866,7 +883,7 @@ bot.command('status', async ctx => {
 // These are intercepted at the bot layer and never reach the Claude session,
 // so they keep working even if the agent is wedged.
 
-const SERVICE = 'clobster.service'
+// SERVICE comes from the persona block at the top of the file.
 const STATUS_FILE = join(STATE_DIR, 'status.json')
 
 function isAllowed(ctx: Context): boolean {
@@ -969,7 +986,7 @@ bot.command('ctx', async ctx => {
 
 bot.command('new', async ctx => {
   if (!isAllowed(ctx)) return
-  await ctx.reply('🔄 restarting clobster — back in a few seconds')
+  await ctx.reply(`🔄 restarting ${ASSISTANT} — back in a few seconds`)
   // Detach so we survive the reply flush; systemd will kill us and respawn.
   setTimeout(() => { void systemctlUser('restart', SERVICE) }, 250)
 })
@@ -981,7 +998,7 @@ bot.command('new', async ctx => {
 bot.command('stop', async ctx => {
   if (!isAllowed(ctx)) return
   try {
-    await pexec('tmux', ['send-keys', '-t', 'clobster', 'Escape'])
+    await pexec('tmux', ['send-keys', '-t', TMUX_TARGET, 'Escape'])
     await ctx.reply('🛑 Esc sent — current turn interrupted. Send your next message to redirect.')
   } catch (e: any) {
     await ctx.reply(`failed: ${e?.message ?? String(e)}`)
@@ -990,13 +1007,13 @@ bot.command('stop', async ctx => {
 
 bot.command('halt', async ctx => {
   if (!isAllowed(ctx)) return
-  await ctx.reply('💤 halting clobster.service (no auto-restart). Use `systemctl --user start clobster.service` to wake me.')
+  await ctx.reply(`💤 halting ${SERVICE} (no auto-restart). Use \`systemctl --user start ${SERVICE}\` to wake me.`)
   setTimeout(() => { void systemctlUser('stop', SERVICE) }, 250)
 })
 
 // Model / effort switches — inject the built-in slash command into the live
 // tmux pane. No restart, session state preserved.
-const TMUX_TARGET = 'clobster'
+// TMUX_TARGET comes from the persona block at the top of the file.
 async function tmuxSend(line: string): Promise<{ ok: boolean; err?: string }> {
   try {
     await pexec('tmux', ['send-keys', '-t', TMUX_TARGET, line, 'Enter'])
@@ -1040,7 +1057,7 @@ for (const alias of ['opus', 'sonnet', 'haiku', 'fable'] as const) {
     const confirmed = await answerModelDialog()
     await ctx.reply(
       `🤖 switched to ${alias}${confirmed ? ' (confirmed cache-invalidation prompt)' : ''}\n` +
-        `⚠️ live session only — run \`clobster-model ${alias}\` to survive a restart`,
+        `⚠️ live session only — run \`${MODEL_BIN} ${alias}\` to survive a restart`,
     )
   })
 }
@@ -1087,7 +1104,7 @@ bot.command('tail', async ctx => {
   const raw = (ctx.match ?? '').toString().trim()
   const n = Math.min(Math.max(parseInt(raw, 10) || 40, 1), 200)
   try {
-    const { stdout } = await pexec('tmux', ['capture-pane', '-t', 'clobster', '-p', '-S', `-${n}`])
+    const { stdout } = await pexec('tmux', ['capture-pane', '-t', TMUX_TARGET, '-p', '-S', `-${n}`])
     const out = stdout.replace(/\s+$/g, '') || '(empty pane)'
     const body = out.length > 3800 ? out.slice(-3800) : out
     await ctx.reply('```\n' + body + '\n```', { parse_mode: 'MarkdownV2' } as any).catch(async () => {
@@ -1110,20 +1127,20 @@ bot.command('peek', async ctx => {
   let args: string[]
   let mode: string
   if (raw === '') {
-    args = ['capture-pane', '-t', 'clobster', '-p', '-J']
+    args = ['capture-pane', '-t', TMUX_TARGET, '-p', '-J']
     mode = 'visible pane'
   } else if (raw === 'full') {
-    args = ['capture-pane', '-t', 'clobster', '-p', '-J', '-S', '-', '-E', '-']
+    args = ['capture-pane', '-t', TMUX_TARGET, '-p', '-J', '-S', '-', '-E', '-']
     mode = 'full scrollback'
   } else {
     const parsed = parseInt(raw, 10)
     if (Number.isFinite(parsed) && parsed > 0) {
       const n = Math.min(parsed, 10000)
-      args = ['capture-pane', '-t', 'clobster', '-p', '-J', '-S', `-${n}`, '-E', '-']
+      args = ['capture-pane', '-t', TMUX_TARGET, '-p', '-J', '-S', `-${n}`, '-E', '-']
       mode = `last ${n} lines`
     } else {
       // Unrecognized arg → fall through to visible-pane default.
-      args = ['capture-pane', '-t', 'clobster', '-p', '-J']
+      args = ['capture-pane', '-t', TMUX_TARGET, '-p', '-J']
       mode = 'visible pane'
     }
   }
@@ -1139,7 +1156,7 @@ bot.command('peek', async ctx => {
 
   const body = stdout.replace(/\s+$/g, '')
   const lineCount = body ? body.split('\n').length : 0
-  const header = `🖥 tmux clobster — ${mode}${lineCount ? `, ${lineCount} lines` : ''}`
+  const header = `🖥 tmux ${TMUX_TARGET} — ${mode}${lineCount ? `, ${lineCount} lines` : ''}`
 
   if (!body) {
     await ctx.reply(`${header}\n\n(empty pane)`)
@@ -1343,7 +1360,7 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
-// Local Whisper transcription via ~/bin/clobster-transcribe.
+// Local Whisper transcription via the assistant's transcribe binary (persona block).
 // Returns the transcript on success, undefined on silence / error.
 // Spawned per-message — model load (~4s) + transcription cost lives here, not in Claude's turn.
 async function transcribeFileId(file_id: string, extHint: string): Promise<string | undefined> {
@@ -1366,7 +1383,7 @@ async function transcribeFileId(file_id: string, extHint: string): Promise<strin
     return undefined
   }
   try {
-    const { stdout } = await pexec('/home/clobster/bin/clobster-transcribe', [path], {
+    const { stdout } = await pexec(TRANSCRIBE_BIN, [path], {
       timeout: 120_000,
       maxBuffer: 1024 * 1024,
     })
@@ -1564,7 +1581,7 @@ if (!SHOULD_POLL) {
   process.stderr.write(`telegram channel: tool-only mode, skipping bot.start()\n`)
   // Promotion watchdog. If we yielded to a peer at startup but that peer dies
   // or stops heartbeating, take over — otherwise an inherited-yield keeps us
-  // tool-only forever (observed after clobster.service double-restart).
+  // tool-only forever (observed after a service double-restart).
   const promotionTimer = setInterval(() => {
     if (shuttingDown) { clearInterval(promotionTimer); return }
     const holder = checkPidSlot()
